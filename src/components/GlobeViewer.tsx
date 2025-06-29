@@ -642,7 +642,7 @@ const GlobeViewer: React.FC = () => {
                                             </div>
                                             {displaySecondaryLat != null && displaySecondaryLng != null && (
                                                 <a 
-                                                    href={`https://www.google.com/maps/@${displaySecondaryLat},${displaySecondaryLng},5z`} 
+                                                    href={`https://www.google.com/maps/search/?api=1&query=${displaySecondaryLat},${displaySecondaryLng}`}
                                                     target="_blank" 
                                                     rel="noopener noreferrer" 
                                                     title="Open in Google Maps" 
@@ -669,7 +669,7 @@ const GlobeViewer: React.FC = () => {
                                             </div>
                                             {pointOfView.lat != null && pointOfView.lng != null && (
                                                 <a 
-                                                    href={`https://www.google.com/maps/@${pointOfView.lat},${pointOfView.lng},5z`} 
+                                                    href={`https://www.google.com/maps/search/?api=1&query=${pointOfView.lat},${pointOfView.lng}`}
                                                     target="_blank" 
                                                     rel="noopener noreferrer" 
                                                     title="Open in Google Maps" 
