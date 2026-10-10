@@ -18,10 +18,10 @@ export const generateSlug = (name: string): string => {
 };
 
 const prehistoricMapOptionsRaw: Omit<PrehistoricMapOption, 'ageMa' | 'slug'>[] = [
-  { name: 'Early Jurassic (~200 Ma)', url: 'https://upload.wikimedia.org/wikipedia/commons/9/9a/World_200ma_6.webp', attribution: 'C. R. Scotese, PALEOMAP Project. CC BY-SA 4.0. Via Wikimedia Commons.' },
-  { name: 'Early Cretaceous (~120 Ma)', url: 'https://upload.wikimedia.org/wikipedia/commons/f/fa/Cretaceous_120ma_map_1.webp', attribution: 'C. R. Scotese, PALEOMAP Project. CC BY-SA 4.0. Via Wikimedia Commons.' },
-  { name: 'Early Triassic (~240 Ma)', url: 'https://upload.wikimedia.org/wikipedia/commons/0/0d/Trias_240ma_5.webp', attribution: 'C. R. Scotese, PALEOMAP Project. CC BY-SA 4.0. Via Wikimedia Commons.' },
-  { name: 'Middle Jurassic (~165 Ma)', url: 'https://upload.wikimedia.org/wikipedia/commons/6/60/Jura_165_ma_4.webp', attribution: 'C. R. Scotese, PALEOMAP Project. CC BY-SA 4.0. Via Wikimedia Commons.' },
+  { name: 'Early Jurassic (~200 Ma)', url: '/paleo/scotese-200ma.jpg', attribution: 'C. R. Scotese, PALEOMAP PaleoAtlas for GPlates v3 (2016). CC BY 4.0. Via Zenodo (doi:10.5281/zenodo.5460860).' },
+  { name: 'Early Cretaceous (~120 Ma)', url: '/paleo/scotese-120ma.jpg', attribution: 'C. R. Scotese, PALEOMAP PaleoAtlas for GPlates v3 (2016). CC BY 4.0. Via Zenodo (doi:10.5281/zenodo.5460860).' },
+  { name: 'Early Triassic (~240 Ma)', url: '/paleo/scotese-240ma.jpg', attribution: 'C. R. Scotese, PALEOMAP PaleoAtlas for GPlates v3 (2016). CC BY 4.0. Via Zenodo (doi:10.5281/zenodo.5460860).' },
+  { name: 'Middle Jurassic (~165 Ma)', url: '/paleo/scotese-165ma.jpg', attribution: 'C. R. Scotese, PALEOMAP PaleoAtlas for GPlates v3 (2016). CC BY 4.0. Via Zenodo (doi:10.5281/zenodo.5460860).' },
 ];
 
 export const prehistoricMapOptions: PrehistoricMapOption[] = prehistoricMapOptionsRaw

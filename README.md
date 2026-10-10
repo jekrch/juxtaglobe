@@ -43,7 +43,7 @@ An interactive dual-globe visualization tool that lets you explore Earth from mu
 - Middle Jurassic (~165 Ma) - Pangea beginning to break apart
 - Early Cretaceous (~120 Ma) - Continental drift in progress
 
-*Maps courtesy of C. R. Scotese, PALEOMAP Project (CC BY-SA 4.0)*
+*Maps courtesy of C. R. Scotese, [PALEOMAP PaleoAtlas for GPlates v3](https://doi.org/10.5281/zenodo.5460860) (CC BY 4.0)*
 
 ## URL Parameters
 

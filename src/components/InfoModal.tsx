@@ -1,7 +1,12 @@
-import React from 'react';
-import { X, ChevronDown, Info } from 'lucide-react';
+import React, { useEffect, useRef, useState } from 'react';
+import { X, Info } from 'lucide-react';
 import { FaGithub } from 'react-icons/fa';
 import type { PrehistoricMapOption } from '../types';
+import Select, { type SelectGroup } from './Select';
+
+// Unmount fallback in case animationend never fires (e.g. a background tab); the
+// close animation itself (index.css) is 180ms
+const CLOSE_FALLBACK_MS = 400;
 
 interface InfoModalProps {
   isOpen: boolean;
@@ -9,7 +14,7 @@ interface InfoModalProps {
   secondaryGlobeMode: 'antipodal' | 'prehistoric_same_point' | 'dual-point';
   selectedPrehistoricMap: PrehistoricMapOption | null;
   prehistoricMapOptions: PrehistoricMapOption[];
-  onSecondaryGlobeOptionChange: (event: React.ChangeEvent<HTMLSelectElement>) => void;
+  onSecondaryGlobeOptionChange: (value: string) => void;
   onAttributionClick: (text: string, event: React.MouseEvent) => void;
   showMapTiles: boolean;
   onMapTilesToggle: (checked: boolean) => void;
@@ -26,7 +31,33 @@ const InfoModal: React.FC<InfoModalProps> = ({
   showMapTiles,
   onMapTilesToggle,
 }) => {
-  if (!isOpen) return null;
+  // Stay mounted through the close animation, then unmount
+  const [isMounted, setIsMounted] = useState(isOpen);
+  if (isOpen && !isMounted) setIsMounted(true);
+  const isClosing = isMounted && !isOpen;
+
+  useEffect(() => {
+    if (!isClosing) return;
+    const timer = setTimeout(() => setIsMounted(false), CLOSE_FALLBACK_MS);
+    return () => clearTimeout(timer);
+  }, [isClosing]);
+
+  const handleBackdropAnimationEnd = (event: React.AnimationEvent<HTMLDivElement>) => {
+    if (isClosing && event.target === event.currentTarget) setIsMounted(false);
+  };
+
+  // Close only when the press both starts and ends on the backdrop, so a drag that
+  // starts inside the panel (e.g. selecting text) doesn't close it
+  const pressStartedOnBackdrop = useRef(false);
+  const handleBackdropPointerDown = (event: React.PointerEvent<HTMLDivElement>) => {
+    pressStartedOnBackdrop.current = event.target === event.currentTarget;
+  };
+  const handleBackdropClick = (event: React.MouseEvent<HTMLDivElement>) => {
+    if (pressStartedOnBackdrop.current && event.target === event.currentTarget) onClose();
+    pressStartedOnBackdrop.current = false;
+  };
+
+  if (!isMounted) return null;
 
   const currentYear = new Date().getFullYear();
 
@@ -43,6 +74,24 @@ const InfoModal: React.FC<InfoModalProps> = ({
     }
   };
 
+  const selectGroups: SelectGroup[] = [
+    {
+      label: 'Modern Earth',
+      options: [
+        { value: 'antipodal', label: 'Antipodal View' },
+        { value: 'dual-point', label: 'Dual Point View' },
+      ],
+    },
+    {
+      label: 'Prehistoric Earth',
+      // "Early Jurassic (~200 Ma)" -> label "Early Jurassic", detail "~200 Ma"
+      options: prehistoricMapOptions.map(map => {
+        const match = map.name.match(/^(.*?)\s*\((.+)\)$/);
+        return { value: map.url, label: match?.[1] ?? map.name, detail: match?.[2] };
+      }),
+    },
+  ];
+
   const getDescriptionText = () => {
     switch (secondaryGlobeMode) {
         case 'antipodal': return "Shows the point directly opposite the primary globe's center.";
@@ -53,8 +102,21 @@ const InfoModal: React.FC<InfoModalProps> = ({
   }
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-neutral-950/80 backdrop-blur-lg animate-fadeIn">
-      <div className="bg-neutral-800/70 backdrop-blur-xl rounded-2xl p-7 max-w-md w-full border border-neutral-700 shadow-2xl animate-slideUp">
+    <div
+      className={`fixed inset-0 z-50 flex items-center justify-center p-4 bg-neutral-950/80 backdrop-blur-lg ${
+        isClosing ? 'pointer-events-none modal-backdrop-out' : 'modal-backdrop-in'
+      }`}
+      onAnimationEnd={handleBackdropAnimationEnd}
+      onPointerDown={handleBackdropPointerDown}
+      onClick={handleBackdropClick}
+    >
+      <div
+        role="dialog"
+        aria-modal="true"
+        className={`bg-neutral-800/70 backdrop-blur-xl rounded-2xl p-7 max-w-md w-full border border-neutral-700 shadow-2xl ${
+          isClosing ? 'modal-panel-out' : 'modal-panel-in'
+        }`}
+      >
         <div className="flex justify-between items-start mb-5">
           <h2 className="text-xl font-medium text-neutral-100">Options & Info</h2>
           <button onClick={onClose} className="text-neutral-500 hover:text-neutral-200 transition-colors p-1 -mr-1 -mt-1 rounded-md hover:bg-neutral-700/50">
@@ -63,18 +125,12 @@ const InfoModal: React.FC<InfoModalProps> = ({
         </div>
         <div className="mb-6 space-y-3">
           <h3 className="text-neutral-100 font-semibold">Secondary Globe Display</h3>
-          <div className="relative">
-            <select
-              value={getSelectValue()}
-              onChange={onSecondaryGlobeOptionChange}
-              className="w-full appearance-none bg-neutral-700/60 border border-neutral-600 text-neutral-100 text-sm rounded-lg focus:ring-blue-500 focus:border-blue-500 block p-2.5 pr-8"
-            >
-              <option value="antipodal">Modern Antipodal View</option>
-              <option value="dual-point">Dual Point View</option>
-              {prehistoricMapOptions.map(map => (<option key={map.url} value={map.url}>{map.name}</option>))}
-            </select>
-            <ChevronDown size={16} className="absolute right-3 top-1/2 -translate-y-1/2 text-neutral-400 pointer-events-none" />
-          </div>
+          <Select
+            value={getSelectValue()}
+            groups={selectGroups}
+            onChange={onSecondaryGlobeOptionChange}
+            ariaLabel="Secondary globe display"
+          />
           <p className="text-xs text-neutral-500">
             {getDescriptionText()}
           </p>
@@ -108,6 +164,9 @@ const InfoModal: React.FC<InfoModalProps> = ({
               </p>
             </div>
           </label>
+          <p className="text-xs text-neutral-500 mt-3">
+            Zoomed-in satellite imagery: Esri, Maxar, Earthstar Geographics, and the GIS User Community
+          </p>
         </div>
 
         <div className="mt-6 pt-4 border-t border-neutral-700/70 flex justify-between items-center text-xs -mb-2">

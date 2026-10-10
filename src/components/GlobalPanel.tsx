@@ -1,7 +1,144 @@
-import React, { useEffect, useMemo } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import Globe from 'react-globe.gl';
 import type { GlobeMethods } from 'react-globe.gl';
 import type { PointOfView } from '../types';
+import { Camera, MathUtils, Mesh, Object3D, OrthographicCamera, PerspectiveCamera, SphereGeometry, Texture, Vector3 } from 'three';
+import type { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
+
+// Sharpen textures viewed at oblique angles (globe edges). three.js clamps this
+// to the GPU's max supported anisotropy, so a high value is safe everywhere.
+Texture.DEFAULT_ANISOTROPY = 16;
+
+// Below this altitude (in globe radii) Earth globes switch from the base image to
+// satellite tiles, which keep loading finer detail the further you zoom. Kept low
+// because the satellite imagery has much darker oceans than the base image, which
+// dominates the view when zoomed out.
+const SATELLITE_TILES_MAX_ALTITUDE = 0.5;
+// blankTile=false makes Esri 404 where it has no imagery (e.g. open ocean past z13)
+// instead of serving a "Map data not yet available" placeholder. The tile engine
+// skips failed tiles, so the previous, more zoomed-out level stays visible there.
+const satelliteTileUrl = (x: number, y: number, z: number) =>
+  `https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/${z}/${y}/${x}?blankTile=false`;
+const streetTileUrl = (x: number, y: number, z: number) =>
+  `https://tile.openstreetmap.org/${z}/${x}/${y}.png`;
+// Deepest tile level each source serves. Esri has z20 in many places and 404s where it
+// doesn't, which falls back to z19 as above; OSM stops at z19.
+const SATELLITE_TILES_MAX_LEVEL = 20;
+const STREET_TILES_MAX_LEVEL = 19;
+
+// globe.gl's drag speed per unit altitude
+const GLOBE_GL_ROTATE_FACTOR = 0.3;
+// globe.gl's fixed camera near plane, which is what caps its zoom at ~3.5 km above Earth
+const GLOBE_GL_CAMERA_NEAR = 0.05;
+// Closest zoom, in globe radii (~32 m above Earth)
+const MIN_ALTITUDE = 0.000005;
+
+type TileUrlFn = (x: number, y: number, z: number) => string;
+
+// three-globe's group holding the image globe mesh and the tile engine
+const findGlobeGroup = (globe: GlobeMethods) => {
+  let globeGroup: Object3D | undefined;
+  globe.scene().traverse(obj => {
+    if ((obj as Object3D & { __globeObjType?: string }).__globeObjType === 'globe') globeGroup = obj;
+  });
+  return globeGroup;
+};
+
+type TileEngine = Object3D & { level: number; maxLevel: number; clearTiles: () => void; updatePov: (camera: unknown) => void };
+
+const findTileEngine = (globe: GlobeMethods) =>
+  findGlobeGroup(globe)?.children.find(c => 'clearTiles' in c) as TileEngine | undefined;
+
+/**
+ * The tile engine only fetches tiles for its current level, and coarser levels stay underneath
+ * to fill tiles that fail (Esri 404s where it has no imagery that deep, e.g. z18+ in much of
+ * the world). That only works if the coarser levels were loaded on the way down; starting
+ * zoomed in, the engine jumps straight from level 0 and leaves nothing beneath the 404s. Step
+ * through the skipped levels instead, so each fetches its few tiles covering the view.
+ */
+const fillSkippedTileLevels = (globe: GlobeMethods) => {
+  const tileEngine = findTileEngine(globe);
+  if (!tileEngine || tileEngine.userData.fillsSkippedLevels) return;
+
+  // The engine only fetches tiles with their centre or a corner in view, which rules out coarse
+  // tiles much larger than the view. It already limits the search to the few tiles around the
+  // camera, so fetch the skipped levels from the same spot through a frustum that takes in everything.
+  const seeAllCamera = new OrthographicCamera(-1e5, 1e5, 1e5, -1e5, -1e5, 1e5);
+  let camera: Camera | undefined;
+  let fillingSkippedLevels = false;
+
+  const updatePov = tileEngine.updatePov;
+  tileEngine.updatePov = function (cam) {
+    if (cam instanceof Camera) camera = cam;
+    updatePov.call(this, cam);
+  };
+
+  const { get, set } = Object.getOwnPropertyDescriptor(Object.getPrototypeOf(tileEngine), 'level')!;
+  Object.defineProperty(tileEngine, 'level', {
+    get,
+    set(level: number) {
+      const prevLevel: number = get!.call(this);
+      if (fillingSkippedLevels) {
+        // Stop short of the target level, which the real camera's pass below sets
+        for (let l = prevLevel + 1; l < level; l++) set!.call(this, l);
+      } else if (level > prevLevel + 1 && camera) {
+        fillingSkippedLevels = true;
+        seeAllCamera.position.copy(camera.position);
+        updatePov.call(this, seeAllCamera);
+        fillingSkippedLevels = false;
+        updatePov.call(this, camera);
+      } else {
+        set!.call(this, level);
+      }
+    },
+  });
+  tileEngine.userData.fillsSkippedLevels = true;
+};
+
+/**
+ * Tiles are built in globe coordinates, where float32 vertex positions are only accurate to about
+ * a metre, so near the surface the imagery wobbles as the camera moves. Give each tile its own
+ * origin at its centre instead: three.js combines the camera and object transforms in float64,
+ * so the GPU only sees small, precise camera-relative numbers.
+ */
+const recenterTilesOnAdd = (globe: GlobeMethods) => {
+  const tileEngine = findTileEngine(globe);
+  if (!tileEngine || tileEngine.userData.recentersTiles) return;
+
+  const add = tileEngine.add;
+  tileEngine.add = function (...objects: Object3D[]) {
+    objects.forEach(obj => {
+      if (!(obj instanceof Mesh) || !(obj.geometry instanceof SphereGeometry) || obj.userData.recentered) return;
+      const geometry = obj.geometry;
+      geometry.computeBoundingBox();
+      const center = geometry.boundingBox!.getCenter(new Vector3());
+      geometry.translate(-center.x, -center.y, -center.z);
+      obj.position.copy(center);
+      // Coarser levels stay underneath the current one, which relies on them drawing first. They
+      // used to share one origin and draw in creation order; now three.js would sort by distance.
+      obj.renderOrder = Math.round(Math.log2((2 * Math.PI) / geometry.parameters.phiLength));
+      obj.userData.recentered = true;
+    });
+    return add.apply(this, objects);
+  };
+  tileEngine.userData.recentersTiles = true;
+};
+
+/**
+ * three-globe hides the image globe whenever tiles are on, which shows black while
+ * tiles load and at the poles (tiles stop at ±85°). Add a slightly smaller copy of
+ * the image globe beneath the tile layer so those gaps show the image instead.
+ */
+const addBaseImageUnderlay = (globe: GlobeMethods) => {
+  const globeGroup = findGlobeGroup(globe);
+  const globeObj = globeGroup?.children.find((c): c is Mesh => c instanceof Mesh);
+  if (!globeGroup || !globeObj || globeGroup.userData.hasUnderlay) return;
+
+  const underlay = globeObj.clone(); // shares geometry & material, so it tracks image changes
+  underlay.scale.setScalar(0.995);
+  globeGroup.add(underlay);
+  globeGroup.userData.hasUnderlay = true;
+};
 
 interface GlobePanelProps {
   panelRef: React.RefObject<HTMLDivElement>;
@@ -33,35 +170,128 @@ const GlobePanel: React.FC<GlobePanelProps> = ({
   showMapTiles = false,
 }) => {
   const isEligibleForMapTiles = globeImageUrl.toLowerCase().includes('earth');
-  const shouldShowTiles = showMapTiles && isEligibleForMapTiles;
+  const [isZoomedIn, setIsZoomedIn] = useState(false);
 
-  // 1. Determine if the globe should animate based on the URL parameter.
+  let tileUrl: TileUrlFn | undefined;
+  if (isEligibleForMapTiles) {
+    if (showMapTiles) tileUrl = streetTileUrl;
+    else if (isZoomedIn) tileUrl = satelliteTileUrl;
+  }
+
+  // The tile engine keeps cached tiles when its URL changes, so switching between
+  // street and satellite tiles would leave the old ones on screen. Clear and refetch,
+  // starting back from level 0 so the coarser fallback levels are refetched too.
+  const lastTileUrlRef = useRef<TileUrlFn | undefined>(undefined);
+  useEffect(() => {
+    if (!tileUrl) return;
+    const globe = globeRef.current;
+    const tileEngine = globe && findTileEngine(globe);
+    if (tileEngine && lastTileUrlRef.current && lastTileUrlRef.current !== tileUrl) {
+      tileEngine.clearTiles();
+      tileEngine.level = 0;
+      tileEngine.updatePov(globe.camera());
+    }
+    lastTileUrlRef.current = tileUrl;
+  }, [tileUrl, globeRef]);
+
+  // react-globe.gl doesn't pass globeTileEngineMaxLevel through, so set it on the engine
+  const tileMaxLevel = showMapTiles ? STREET_TILES_MAX_LEVEL : SATELLITE_TILES_MAX_LEVEL;
+  const applyTileMaxLevel = () => {
+    const tileEngine = globeRef.current && findTileEngine(globeRef.current);
+    if (tileEngine) tileEngine.maxLevel = tileMaxLevel;
+  };
+  useEffect(applyTileMaxLevel, [tileMaxLevel, globeRef]);
+
+  const handleZoom = (pov: PointOfView) => {
+    if (pov.altitude != null) setIsZoomedIn(pov.altitude < SATELLITE_TILES_MAX_ALTITUDE);
+    onZoom(pov);
+  };
+
+  const handleGlobeReady = () => {
+    if (globeRef.current) {
+      addBaseImageUnderlay(globeRef.current);
+      recenterTilesOnAdd(globeRef.current);
+      fillSkippedTileLevels(globeRef.current);
+    }
+    applyTileMaxLevel();
+    onGlobeReady();
+  };
+
+  // 1. Determine if the globe should animate based on the URL parameters.
   //    useMemo ensures this logic runs only once when the component mounts.
+  //    Skip it when tiles show from the start: animateIn scales and spins the globe after
+  //    onGlobeReady, and the tile engine, seeing a shrunken, rotated globe, requests
+  //    thousands of tiles in the wrong place that hold up the ones actually in view.
   const shouldAnimateIn = useMemo(() => {
     const urlParams = new URLSearchParams(window.location.search);
-    const skipAnimation = urlParams.get('map') === 't';
-    return !skipAnimation; // Animate only if 'map=t' is NOT present
+    const startsWithTiles = urlParams.get('map') === 't'
+      || parseFloat(urlParams.get('alt') ?? '') < SATELLITE_TILES_MAX_ALTITUDE;
+    return !startsWithTiles;
   }, []);
 
   useEffect(() => {
-    if (globeRef.current) {
-      const globe = globeRef.current;
-      const controls = (globe as any).controls();
-      
-      if (controls) {
-        controls.rotateSpeed = 1;
-        controls.enableDamping = true;
-        controls.dampingFactor = 0.1;
-        controls.enablePan = false;
-        controls.autoRotate = false;
+    const globe = globeRef.current;
+    if (!globe) return;
+    const controls = globe.controls() as OrbitControls;
+    const camera = globe.camera() as PerspectiveCamera;
 
-        // Add pole angle restrictions to prevent gimbal lock
-        // These values prevent the camera from going directly over the poles
-        controls.minPolarAngle = 0.1; // ~5.7 degrees from north pole
-        controls.maxPolarAngle = Math.PI - 0.1; // ~5.7 degrees from south pole
+    controls.enableDamping = true;
+    controls.dampingFactor = 0.1;
+    controls.enablePan = false;
+    controls.autoRotate = false;
+    // globe.gl enables zoom-to-cursor, which drags the centre point toward the cursor while
+    // zooming. Zoom straight in/out instead so the current location stays put.
+    controls.zoomToCursor = false;
 
+    // Add pole angle restrictions to prevent gimbal lock
+    // These values prevent the camera from going directly over the poles
+    controls.minPolarAngle = 0.1; // ~5.7 degrees from north pole
+    controls.maxPolarAngle = Math.PI - 0.1; // ~5.7 degrees from south pole
+
+    const globeRadius = globe.getGlobeRadius();
+    controls.minDistance = globeRadius * (1 + MIN_ALTITUDE);
+
+    // globe.gl resets both speeds on every camera change (rotate ∝ altitude, zoom ∝ √altitude).
+    // Its zoom speed is far too coarse near the surface: OrbitControls scales the distance to the
+    // globe centre, not the altitude, so at altitude 0.001 a 2× pinch changes altitude ~12×.
+    // This listener runs after globe.gl's, so it overrides them.
+    const tuneControlSpeeds = () => {
+      const altitude = globe.pointOfView().altitude;
+      // Pinch scales altitude 1:1 (and a wheel notch ~5%, as globe.gl does at altitude 1)
+      controls.zoomSpeed = altitude / (1 + altitude);
+      // Near the surface, keep the ground under the cursor instead of globe.gl's 2× drag. Blend back
+      // to globe.gl's faster spin by altitude 1, where the globe is seen whole.
+      const groundLockedFactor = Math.tan(MathUtils.degToRad(camera.fov / 2)) / Math.PI;
+      const factor = groundLockedFactor + (GLOBE_GL_ROTATE_FACTOR - groundLockedFactor) * Math.min(1, altitude);
+      controls.rotateSpeed = altitude * factor;
+      // Pull the near plane in with the camera so it never clips the surface below. Keep
+      // globe.gl's value further out, where a smaller one would only cost depth precision.
+      camera.near = Math.min(GLOBE_GL_CAMERA_NEAR, altitude * globeRadius * 0.5);
+      camera.updateProjectionMatrix();
+    };
+    tuneControlSpeeds();
+    controls.addEventListener('change', tuneControlSpeeds);
+
+    // OrbitControls only emits 'change' once the camera has moved 0.001 units (~64 m) since the last
+    // one. Near the surface each frame moves far less, so everything hanging off it (the other
+    // globe's sync, tile loading, the tuning above) lags and then jumps. Emit it from ~0.1 px instead.
+    const update = controls.update;
+    const lastPosition = camera.position.clone();
+    controls.update = function (deltaTime) {
+      let changed = update.call(this, deltaTime);
+      const threshold = (camera.position.length() - globeRadius) * 1e-4;
+      if (!changed && camera.position.distanceToSquared(lastPosition) > threshold ** 2) {
+        this.dispatchEvent({ type: 'change' });
+        changed = true;
       }
-    }
+      if (changed) lastPosition.copy(camera.position);
+      return changed;
+    };
+
+    return () => {
+      controls.removeEventListener('change', tuneControlSpeeds);
+      controls.update = update;
+    };
   }, [globeRef]);
 
   return (
@@ -90,15 +320,15 @@ const GlobePanel: React.FC<GlobePanelProps> = ({
               pointColor="color"
               pointAltitude={0.01}
               pointRadius="size"
-              onGlobeReady={onGlobeReady}
-              onZoom={onZoom}
+              onGlobeReady={handleGlobeReady}
+              onZoom={handleZoom}
               enablePointerInteraction={true}
               atmosphereColor={atmosphereColor}
               atmosphereAltitude={0.18}
               width={dimensions.width}
               height={dimensions.height}
               rendererConfig={{ antialias: true, alpha: true, preserveDrawingBuffer: true }}
-              globeTileEngineUrl={shouldShowTiles ? (x, y, z) => `https://tile.openstreetmap.org/${z}/${x}/${y}.png` : undefined}
+              globeTileEngineUrl={tileUrl}
               animateIn={shouldAnimateIn}
             />
             <div className="absolute inset-0 flex items-center justify-center pointer-events-none">

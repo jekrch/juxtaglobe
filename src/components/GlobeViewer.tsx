@@ -7,9 +7,11 @@ import InfoModal from './InfoModal';
 import { KANSAS_LOCATION, prehistoricMapOptions } from '../utils/mapData';
 import type { PointOfView, LocationCoordinates, PrehistoricMapOption } from '../types';
 import GlobePanel from './GlobalPanel';
+import LocationSearch from './LocationSearch';
 
 const WIDE_LAYOUT_ALTITUDE_TARGET = KANSAS_LOCATION.altitude ?? 2.5;
 const NARROW_LAYOUT_ALTITUDE_TARGET = 2;
+const PLACE_ANIMATION_MS = 1000;
 
 const GlobeViewer: React.FC = () => {
     // Globe references
@@ -52,6 +54,7 @@ const GlobeViewer: React.FC = () => {
     const activeInteractionGlobeRef = useRef<'main' | 'secondary' | null>(null);
     const programmaticMoveInProgressRef = useRef(false);
     const syncThrottle = useRef<NodeJS.Timeout | null>(null);
+    const placeMoveTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
     // Routing
     const { mapSlug: mapSlugFromParams } = useParams<{ mapSlug?: string }>();
@@ -97,16 +100,16 @@ const GlobeViewer: React.FC = () => {
             const newSearchParams = new URLSearchParams(searchParams);
 
             if (pointOfView.lat != null && pointOfView.lng != null && pointOfView.altitude != null) {
-                newSearchParams.set('lat', pointOfView.lat.toFixed(4));
-                newSearchParams.set('lng', pointOfView.lng.toFixed(4));
-                newSearchParams.set('alt', pointOfView.altitude.toFixed(4));
+                newSearchParams.set('lat', pointOfView.lat.toFixed(5));
+                newSearchParams.set('lng', pointOfView.lng.toFixed(5));
+                newSearchParams.set('alt', pointOfView.altitude.toPrecision(3));
             }
 
             if (secondaryGlobeMode === 'dual-point') {
                 if (secondaryPointOfView.lat != null && secondaryPointOfView.lng != null && secondaryPointOfView.altitude != null) {
-                    newSearchParams.set('lat2', secondaryPointOfView.lat.toFixed(4));
-                    newSearchParams.set('lng2', secondaryPointOfView.lng.toFixed(4));
-                    newSearchParams.set('alt2', secondaryPointOfView.altitude.toFixed(4));
+                    newSearchParams.set('lat2', secondaryPointOfView.lat.toFixed(5));
+                    newSearchParams.set('lng2', secondaryPointOfView.lng.toFixed(5));
+                    newSearchParams.set('alt2', secondaryPointOfView.altitude.toPrecision(3));
                 }
             } else {
                 newSearchParams.delete('lat2');
@@ -466,8 +469,43 @@ const GlobeViewer: React.FC = () => {
         }
     };
 
-    const handleSecondaryGlobeOptionChange = (event: React.ChangeEvent<HTMLSelectElement>) => {
-        const value = event.target.value;
+    /**
+     * Move to a searched place. In dual-point mode only the searched globe moves and the
+     * lock offset is recalculated, so search sets each point independently.
+     */
+    const goToPlace = (coords: LocationCoordinates, globeIdentifier: 'main' | 'secondary') => {
+        if (!initialAnimationDone.current) return;
+        if (syncThrottle.current) { clearTimeout(syncThrottle.current); syncThrottle.current = null; }
+        if (placeMoveTimer.current) clearTimeout(placeMoveTimer.current);
+        activeInteractionGlobeRef.current = null;
+        ipLookupAttempted.current = true;
+
+        // Drive the globes directly and hold off the POV sync effects and zoom handler until the animation ends
+        programmaticMoveInProgressRef.current = true;
+        const target = { ...coords, altitude: latestPovs.current.primary.altitude };
+
+        if (secondaryGlobeMode === 'dual-point') {
+            const primary = globeIdentifier === 'main' ? target : latestPovs.current.primary as LocationCoordinates;
+            const secondary = globeIdentifier === 'secondary' ? target : latestPovs.current.secondary as LocationCoordinates;
+            povOffset.current = { lat: secondary.lat - primary.lat, lng: secondary.lng - primary.lng };
+            const globe = globeIdentifier === 'main' ? globeEl : secondaryGlobeEl;
+            globe.current?.pointOfView(target, PLACE_ANIMATION_MS);
+            setPointOfView(primary);
+            setSecondaryPointOfView(secondary);
+        } else {
+            globeEl.current?.pointOfView(target, PLACE_ANIMATION_MS);
+            const secondaryTarget = secondaryGlobeMode === 'prehistoric_same_point' ? target : getAntipodal(target);
+            secondaryGlobeEl.current?.pointOfView(secondaryTarget, PLACE_ANIMATION_MS);
+            setPointOfView(target);
+        }
+
+        placeMoveTimer.current = setTimeout(() => {
+            programmaticMoveInProgressRef.current = false;
+            placeMoveTimer.current = null;
+        }, PLACE_ANIMATION_MS + 100);
+    };
+
+    const handleSecondaryGlobeOptionChange = (value: string) => {
         const slug = (value === 'antipodal' || value === 'dual-point') 
             ? value 
             : prehistoricMapOptions.find(m => m.url === value)?.slug || 'antipodal';
@@ -499,6 +537,14 @@ const GlobeViewer: React.FC = () => {
 
     useEffect(() => { 
         if (!showInfoModal) setAttributionPopover(null); 
+    }, [showInfoModal]);
+
+    // The info modal's backdrop blur re-filters both globe canvases on every frame they
+    // redraw, which makes its animation stutter. Freeze the globes while it's open.
+    useEffect(() => {
+        const globes = [globeEl.current, secondaryGlobeEl.current];
+        if (showInfoModal) globes.forEach(globe => globe?.pauseAnimation());
+        else globes.forEach(globe => globe?.resumeAnimation());
     }, [showInfoModal]);
 
     // Clean up interaction state on mouse/touch release
@@ -564,6 +610,12 @@ const GlobeViewer: React.FC = () => {
             displaySecondaryLng = pointOfView.lng;
         }
     }
+
+    const secondaryCoordsText = displaySecondaryLat != null && displaySecondaryLng != null 
+        ? `${displaySecondaryLat.toFixed(3)}°, ${displaySecondaryLng.toFixed(3)}°` 
+        : '---.-° ---.-°';
+
+    const coordsBoxClassName = 'bg-neutral-800/50 backdrop-blur-md rounded-lg sm:rounded-xl p-2.5 sm:p-3 border border-neutral-700/80 transition-all duration-300';
 
     const getSecondaryClassNames = (base: 'hover' | 'icon' | 'link') => {
         switch (secondaryGlobeMode) {
@@ -653,13 +705,20 @@ const GlobeViewer: React.FC = () => {
                                                 </a>
                                             )}
                                         </div>
-                                        <div className={`bg-neutral-800/50 backdrop-blur-md rounded-lg sm:rounded-xl p-2.5 sm:p-3 border border-neutral-700/80 transition-all duration-300 ${getSecondaryClassNames('hover')}`}>
-                                            <div className="font-mono text-xs sm:text-sm text-neutral-100 tabular-nums">
-                                                {displaySecondaryLat != null && displaySecondaryLng != null 
-                                                    ? `${displaySecondaryLat.toFixed(3)}°, ${displaySecondaryLng.toFixed(3)}°` 
-                                                    : '---.-° ---.-°'}
+                                        {secondaryGlobeMode === 'dual-point' ? (
+                                            <LocationSearch 
+                                                displayText={secondaryCoordsText} 
+                                                onSelect={(coords) => goToPlace(coords, 'secondary')} 
+                                                className={`${coordsBoxClassName} ${getSecondaryClassNames('hover')}`} 
+                                                ariaLabel="Secondary point" 
+                                            />
+                                        ) : (
+                                            <div className={`${coordsBoxClassName} ${getSecondaryClassNames('hover')}`}>
+                                                <div className="font-mono text-xs sm:text-sm text-neutral-100 tabular-nums">
+                                                    {secondaryCoordsText}
+                                                </div>
                                             </div>
-                                        </div>
+                                        )}
                                     </div>
                                     <div className="group">
                                         <div className="flex items-center justify-between mb-1 sm:mb-2">
@@ -680,11 +739,12 @@ const GlobeViewer: React.FC = () => {
                                                 </a>
                                             )}
                                         </div>
-                                        <div className="bg-neutral-800/50 backdrop-blur-md rounded-lg sm:rounded-xl p-2.5 sm:p-3 border border-neutral-700/80 transition-all duration-300 group-hover:border-blue-500/70 group-hover:shadow-xl group-hover:shadow-blue-500/10">
-                                            <div className="font-mono text-xs sm:text-sm text-neutral-100 tabular-nums">
-                                                {pointOfView.lat?.toFixed(3) ?? '---.-'}°, {pointOfView.lng?.toFixed(3) ?? '---.-'}°
-                                            </div>
-                                        </div>
+                                        <LocationSearch 
+                                            displayText={`${pointOfView.lat?.toFixed(3) ?? '---.-'}°, ${pointOfView.lng?.toFixed(3) ?? '---.-'}°`} 
+                                            onSelect={(coords) => goToPlace(coords, 'main')} 
+                                            className={`${coordsBoxClassName} group-hover:border-blue-500/70 group-hover:shadow-xl group-hover:shadow-blue-500/10`} 
+                                            ariaLabel="Primary view" 
+                                        />
                                     </div>
                                 </div>
                                 <div className="flex-1 w-full lg:flex-none flex flex-col justify-center space-y-2 lg:space-y-2.5 lg:justify-start">
