@@ -288,9 +288,35 @@ const GlobePanel: React.FC<GlobePanelProps> = ({
       return changed;
     };
 
+    // OrbitControls tracks each finger by pointer id and only forgets one on a pointerup/pointercancel
+    // at its canvas. Mobile browsers sometimes drop that event at the end of a pinch, and the leftover
+    // pointer makes every later one-finger drag count as the second finger of a pinch, so dragging
+    // zooms instead of rotating. Once no fingers are left on the screen, drop any it still holds.
+    // (Replaying a pointerup won't do: it releases pointer capture, which throws for a gone pointer.)
+    const internals = controls as unknown as {
+      _pointers: number[];
+      _pointerPositions: Record<number, unknown>;
+      _onPointerMove: (event: PointerEvent) => void;
+      _onPointerUp: (event: PointerEvent) => void;
+      state: number;
+    };
+    const releaseStalePointers = (event: TouchEvent) => {
+      if (event.touches.length > 0 || internals._pointers.length === 0) return;
+      internals._pointers.length = 0;
+      internals._pointerPositions = {};
+      controls.domElement?.removeEventListener('pointermove', internals._onPointerMove);
+      controls.domElement?.removeEventListener('pointerup', internals._onPointerUp);
+      internals.state = -1; // _STATE.NONE
+      controls.dispatchEvent({ type: 'end' });
+    };
+    window.addEventListener('touchend', releaseStalePointers);
+    window.addEventListener('touchcancel', releaseStalePointers);
+
     return () => {
       controls.removeEventListener('change', tuneControlSpeeds);
       controls.update = update;
+      window.removeEventListener('touchend', releaseStalePointers);
+      window.removeEventListener('touchcancel', releaseStalePointers);
     };
   }, [globeRef]);
 
