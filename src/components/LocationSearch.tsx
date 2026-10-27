@@ -285,33 +285,39 @@ const LocationSearch: React.FC<LocationSearchProps> = ({ displayText, onSelect, 
 
   return (
     <div ref={boxRef} className={`${className} flex items-center gap-2 border-neutral-500!`}>
-      {/* 16px on phones so iOS doesn't zoom in on focus. w-0 drops the input's default ~20ch width,
-          which would otherwise widen the panel column and squeeze the buttons beside it */}
-      <input
-        ref={inputRef}
-        type="text"
-        role="combobox"
-        aria-label={`Search for a place, enter coordinates, or paste a map link to set the ${ariaLabel.toLowerCase()}`}
-        aria-autocomplete="list"
-        aria-expanded={hasOptions}
-        aria-controls={`${id}-listbox`}
-        aria-activedescendant={hasOptions ? `${id}-option-${activeIndex}` : undefined}
-        autoComplete="off"
-        spellCheck={false}
-        enterKeyHint="search"
-        placeholder="Place or lat, lng…"
-        value={query}
-        onChange={e => {
-          setQuery(e.target.value);
-          setActiveIndex(0);
-        }}
-        onKeyDown={handleKeyDown}
-        onBlur={() => stopEditing(false)}
-        className="flex-1 min-w-0 w-0 bg-transparent border-0 p-0 outline-none text-base leading-4 sm:text-sm sm:leading-5 text-neutral-100 placeholder:text-neutral-500"
-      />
+      {/* An invisible copy of the readout sizes the box, so it's exactly the size it was closed and the
+          panel around it doesn't shift. The input is laid over it, out of the layout, so its default width
+          and its taller 16px text can't grow the box */}
+      <div className="relative flex-1 min-w-0">
+        <span aria-hidden="true" className="invisible block truncate font-mono text-xs sm:text-sm tabular-nums">{displayText}</span>
+        {/* 16px on phones so iOS doesn't zoom in on focus */}
+        <input
+          ref={inputRef}
+          type="text"
+          role="combobox"
+          aria-label={`Search for a place, enter coordinates, or paste a map link to set the ${ariaLabel.toLowerCase()}`}
+          aria-autocomplete="list"
+          aria-expanded={hasOptions}
+          aria-controls={`${id}-listbox`}
+          aria-activedescendant={hasOptions ? `${id}-option-${activeIndex}` : undefined}
+          autoComplete="off"
+          spellCheck={false}
+          enterKeyHint="search"
+          placeholder="Place or lat, lng…"
+          value={query}
+          onChange={e => {
+            setQuery(e.target.value);
+            setActiveIndex(0);
+          }}
+          onKeyDown={handleKeyDown}
+          onBlur={() => stopEditing(false)}
+          className="absolute inset-x-0 top-1/2 -translate-y-1/2 h-6 w-full bg-transparent border-0 p-0 outline-none text-base sm:text-sm text-neutral-100 placeholder:text-neutral-500"
+        />
+      </div>
+      {/* Same size as the readout's chevron so the box keeps its width */}
       {status === 'loading'
-        ? <Loader2 size={13} className="shrink-0 text-neutral-400 animate-spin" />
-        : <Search size={13} className="shrink-0 text-neutral-500" />}
+        ? <Loader2 size={15} className="shrink-0 text-neutral-400 animate-spin" />
+        : <Search size={15} className="shrink-0 text-neutral-500" />}
 
       {showMenu && menuPosition && createPortal(
         <div
