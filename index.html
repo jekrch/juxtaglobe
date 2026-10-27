@@ -4,6 +4,12 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <!-- iOS zooms in on focused text fields. maximum-scale stops that there while pinch zoom
+       still works, but elsewhere it blocks pinch zoom, so it's only set on iOS (iPads report as Macs) -->
+  <script>
+    if (/iPhone|iPad|iPod/.test(navigator.userAgent) || (/Macintosh/.test(navigator.userAgent) && navigator.maxTouchPoints > 1))
+      document.querySelector('meta[name="viewport"]').setAttribute('content', 'width=device-width, initial-scale=1.0, maximum-scale=1.0');
+  </script>
 
   <!-- Primary Meta Tags -->
   <title>JuxtaGlobe - Interactive Dual Globe Visualization | Explore Earth's Antipodal Points & Prehistoric Maps</title>
@@ -276,8 +282,8 @@
       }
     })();
   </script>
-  <script type="module" crossorigin src="/assets/index-CYq02veO.js"></script>
-  <link rel="stylesheet" crossorigin href="/assets/index-B2_2iWL1.css">
+  <script type="module" crossorigin src="/assets/index-D0rOek6p.js"></script>
+  <link rel="stylesheet" crossorigin href="/assets/index-DU2umyaF.css">
 <link rel="manifest" href="/manifest.webmanifest"><script id="vite-plugin-pwa:register-sw" src="/registerSW.js"></script></head>
 
 <body>
