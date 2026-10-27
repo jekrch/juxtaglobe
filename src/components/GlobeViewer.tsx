@@ -1,17 +1,46 @@
 import React, { useState, useRef, useEffect, useCallback } from 'react';
 import type { GlobeMethods } from 'react-globe.gl';
-import { MapPin, Globe2, Navigation, Settings, ExternalLink, Lock, Unlock } from 'lucide-react';
+import { MapPin, Globe2, Navigation, Settings, ExternalLink, Lock, Unlock, Landmark } from 'lucide-react';
 import { useParams, useNavigate, useSearchParams } from 'react-router-dom';
 
 import InfoModal from './InfoModal';
 import { KANSAS_LOCATION, prehistoricMapOptions } from '../utils/mapData';
 import type { PointOfView, LocationCoordinates, PrehistoricMapOption } from '../types';
 import GlobePanel from './GlobalPanel';
-import LocationSearch from './LocationSearch';
+import LocationSearch, { type Place } from './LocationSearch';
+import { findLandmark, landmarkCoordinates, landmarks } from '../utils/landmarks';
 
 const WIDE_LAYOUT_ALTITUDE_TARGET = KANSAS_LOCATION.altitude ?? 2.5;
 const NARROW_LAYOUT_ALTITUDE_TARGET = 2;
 const PLACE_ANIMATION_MS = 1000;
+// Wait for the globes to animate in before looking up the user's location or zooming in
+const INTRO_DELAY_MS = 1500;
+
+// The browser's own fix is precise (GPS or Wi-Fi) but asks permission; IP lookup is only city-level
+const getPreciseLocation = () => new Promise<LocationCoordinates>((resolve, reject) => {
+    if (!navigator.geolocation) {
+        reject(new Error('Geolocation is unavailable'));
+        return;
+    }
+    navigator.geolocation.getCurrentPosition(
+        ({ coords }) => resolve({ lat: coords.latitude, lng: coords.longitude }),
+        reject,
+        { enableHighAccuracy: true, timeout: 10000, maximumAge: 60000 }
+    );
+});
+
+const getIpLocation = async (): Promise<LocationCoordinates> => {
+    const data = await (await fetch('https://ipapi.co/json/')).json();
+    if (data.latitude == null || data.longitude == null) throw new Error('IP geolocation returned no location');
+    return { lat: data.latitude, lng: data.longitude };
+};
+
+const landmarkSuggestions: Place[] = landmarks.map(landmark => ({
+    id: `landmark-${landmark.slug}`,
+    label: landmark.name,
+    detail: landmark.region,
+    coords: landmarkCoordinates(landmark),
+}));
 
 const GlobeViewer: React.FC = () => {
     // Globe references
@@ -37,11 +66,21 @@ const GlobeViewer: React.FC = () => {
     const [secondaryPointOfView, setSecondaryPointOfView] = useState<PointOfView>(getAntipodal(KANSAS_LOCATION));
     const latestPovs = useRef({ primary: pointOfView, secondary: secondaryPointOfView });
 
+    // Routing
+    const { mapSlug: mapSlugFromParams } = useParams<{ mapSlug?: string }>();
+    const navigate = useNavigate();
+    const [searchParams, setSearchParams] = useSearchParams();
+    const [showMapTiles, setShowMapTiles] = useState(() => searchParams.get('map') === 't');
+
     // Globe mode state
-    const [isDualModeLocked, setIsDualModeLocked] = useState(true);
+    const [isDualModeLocked, setIsDualModeLocked] = useState(() => searchParams.get('lock') !== 'f');
+    // Once the user sets the lock themselves, searching no longer unlocks it
+    const lockChosenByUser = useRef(false);
     const povOffset = useRef({ lat: 0, lng: 0 });
     const [secondaryGlobeMode, setSecondaryGlobeMode] = useState<'antipodal' | 'prehistoric_same_point' | 'dual-point'>('antipodal');
     const [selectedPrehistoricMap, setSelectedPrehistoricMap] = useState<PrehistoricMapOption | null>(null);
+    // Opens the secondary search when "Compare Sizes" switches to dual-point mode
+    const [openSecondarySearch, setOpenSecondarySearch] = useState(false);
 
     // Layout state
     const [isNarrowLayout, setIsNarrowLayout] = useState(window.innerWidth < 1024);
@@ -55,12 +94,8 @@ const GlobeViewer: React.FC = () => {
     const programmaticMoveInProgressRef = useRef(false);
     const syncThrottle = useRef<NodeJS.Timeout | null>(null);
     const placeMoveTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
-
-    // Routing
-    const { mapSlug: mapSlugFromParams } = useParams<{ mapSlug?: string }>();
-    const navigate = useNavigate();
-    const [searchParams, setSearchParams] = useSearchParams();
-    const [showMapTiles, setShowMapTiles] = useState(() => searchParams.get('map') === 't');
+    // The latest goToPlace, for callbacks scheduled from an earlier render
+    const goToPlaceRef = useRef<(coords: LocationCoordinates, globeIdentifier: 'main' | 'secondary') => void>(() => {});
 
     /**
      * Calculate antipodal coordinates (opposite point on Earth)
@@ -98,6 +133,8 @@ const GlobeViewer: React.FC = () => {
 
         const handler = setTimeout(() => {
             const newSearchParams = new URLSearchParams(searchParams);
+            // ?compare=<landmark> only applies on load; the coordinates below take over from it
+            newSearchParams.delete('compare');
 
             if (pointOfView.lat != null && pointOfView.lng != null && pointOfView.altitude != null) {
                 newSearchParams.set('lat', pointOfView.lat.toFixed(5));
@@ -111,17 +148,21 @@ const GlobeViewer: React.FC = () => {
                     newSearchParams.set('lng2', secondaryPointOfView.lng.toFixed(5));
                     newSearchParams.set('alt2', secondaryPointOfView.altitude.toPrecision(3));
                 }
+                // Locked is the default, so only an unlocked view is recorded
+                if (isDualModeLocked) newSearchParams.delete('lock');
+                else newSearchParams.set('lock', 'f');
             } else {
                 newSearchParams.delete('lat2');
                 newSearchParams.delete('lng2');
                 newSearchParams.delete('alt2');
+                newSearchParams.delete('lock');
             }
 
             setSearchParams(newSearchParams, { replace: true });
         }, 300);
 
         return () => clearTimeout(handler);
-    }, [pointOfView, secondaryPointOfView, secondaryGlobeMode, setSearchParams, searchParams]);
+    }, [pointOfView, secondaryPointOfView, secondaryGlobeMode, isDualModeLocked, setSearchParams, searchParams]);
 
     // Handle map tiles toggle from URL
     useEffect(() => {
@@ -290,6 +331,7 @@ const GlobeViewer: React.FC = () => {
                 setSecondaryPointOfView(currentSecondary);
             }
         }
+        lockChosenByUser.current = true;
         setIsDualModeLocked(prev => !prev);
     };
 
@@ -306,6 +348,9 @@ const GlobeViewer: React.FC = () => {
         const lat = parseFloat(searchParams.get('lat') || '');
         const lng = parseFloat(searchParams.get('lng') || '');
         const alt = parseFloat(searchParams.get('alt') || '');
+        // ?compare=<landmark> makes the landmark the secondary point and zooms both globes in to frame it
+        const compareLandmark = slug === 'dual-point' ? findLandmark(searchParams.get('compare')) : undefined;
+        const compareAltitude = compareLandmark && landmarkCoordinates(compareLandmark).altitude;
 
         let initialPrimaryPov: LocationCoordinates | null = null;
         let initialSecondaryPov: LocationCoordinates | null = null;
@@ -318,7 +363,9 @@ const GlobeViewer: React.FC = () => {
                 const lat2 = parseFloat(searchParams.get('lat2') || '');
                 const lng2 = parseFloat(searchParams.get('lng2') || '');
                 const alt2 = parseFloat(searchParams.get('alt2') || '');
-                if (!isNaN(lat2) && !isNaN(lng2) && !isNaN(alt2)) {
+                if (compareLandmark) {
+                    initialSecondaryPov = { lat: compareLandmark.lat, lng: compareLandmark.lng, altitude: alt };
+                } else if (!isNaN(lat2) && !isNaN(lng2) && !isNaN(alt2)) {
                     initialSecondaryPov = { lat: lat2, lng: lng2, altitude: alt2 };
                 } else { 
                     initialSecondaryPov = { ...initialPrimaryPov };
@@ -343,21 +390,28 @@ const GlobeViewer: React.FC = () => {
             initialPrimaryPov = { ...KANSAS_LOCATION, altitude: initialAltitude };
             
             const isPrehistoric = prehistoricMapOptions.some(m => m.slug === slug);
-            const baseSecondary = (slug === 'dual-point' || isPrehistoric) 
+            const baseSecondary = compareLandmark ?? ((slug === 'dual-point' || isPrehistoric) 
                 ? KANSAS_LOCATION 
-                : getAntipodal(KANSAS_LOCATION);
+                : getAntipodal(KANSAS_LOCATION));
                 
-            initialSecondaryPov = { ...baseSecondary, altitude: initialAltitude };
+            initialSecondaryPov = { lat: baseSecondary.lat, lng: baseSecondary.lng, altitude: initialAltitude };
 
             // Attempt IP geolocation after brief delay
             setTimeout(() => {
                 if (ipLookupAttempted.current || urlCoordsApplied.current) return;
                 ipLookupAttempted.current = true;
                 setIsLoading(true);
+                let located = false;
                 fetch('https://ipapi.co/json/')
                     .then(res => res.json())
                     .then(data => {
                         if (data.latitude && data.longitude) {
+                            located = true;
+                            // The effect that moves the primary globe skips dual-point mode, so move it directly
+                            if (slug === 'dual-point') {
+                                goToPlaceRef.current({ lat: data.latitude, lng: data.longitude, altitude: compareAltitude }, 'main');
+                                return;
+                            }
                             // Only animate if map tiles aren't showing
                             if (!showMapTiles) {
                                 expectAnimatedMoveRef.current = true;
@@ -366,8 +420,14 @@ const GlobeViewer: React.FC = () => {
                         }
                     })
                     .catch(e => console.warn('IP-based geolocation failed.', e))
-                    .finally(() => setIsLoading(false));
-            }, 1500);
+                    .finally(() => {
+                        setIsLoading(false);
+                        // Still zoom in to the comparison, from the default location
+                        if (!located && compareAltitude != null) {
+                            goToPlaceRef.current({ lat: KANSAS_LOCATION.lat, lng: KANSAS_LOCATION.lng, altitude: compareAltitude }, 'main');
+                        }
+                    });
+            }, INTRO_DELAY_MS);
         }
 
         // Set initial positions
@@ -379,6 +439,12 @@ const GlobeViewer: React.FC = () => {
 
         initialAnimationDone.current = true;
         setTimeout(() => { programmaticMoveInProgressRef.current = false; }, 100);
+
+        // A comparison link with coordinates zooms in on them; without, the location lookup above does
+        if (compareAltitude != null && urlCoordsApplied.current) {
+            const primary = initialPrimaryPov;
+            setTimeout(() => goToPlaceRef.current({ ...primary, altitude: compareAltitude }, 'main'), INTRO_DELAY_MS);
+        }
     }, [globeReady, secondaryGlobeReady, isNarrowLayout, searchParams, mapSlugFromParams, showMapTiles]);
 
     // Update primary globe position (non-dual-point modes)
@@ -440,30 +506,20 @@ const GlobeViewer: React.FC = () => {
     }, [isNarrowLayout]);
 
     /**
-     * Reset to user's current location via IP geolocation
+     * Move the primary point to the user's location: precise if they allow it, else from their
+     * IP address. In dual-point mode the secondary point stays put, like a search.
      */
     const resetToUserLocation = async () => {
         setIsLoading(true);
         try {
-            const response = await fetch('https://ipapi.co/json/');
-            const data = await response.json();
-            expectAnimatedMoveRef.current = true;
-            const targetLat = data.latitude ?? KANSAS_LOCATION.lat;
-            const targetLng = data.longitude ?? KANSAS_LOCATION.lng;
-            setPointOfView(prev => ({ lat: targetLat, lng: targetLng, altitude: prev.altitude }));
-            if (secondaryGlobeMode === 'dual-point' && isDualModeLocked) {
-                setSecondaryPointOfView(prev => ({ 
-                    lat: targetLat + povOffset.current.lat, 
-                    lng: targetLng + povOffset.current.lng, 
-                    altitude: prev.altitude 
-                }));
-            }
-            activeInteractionGlobeRef.current = null;
+            const location = await getPreciseLocation().catch(error => {
+                console.warn('Precise geolocation failed, falling back to IP.', error);
+                return getIpLocation();
+            });
+            goToPlaceRef.current(location, 'main');
         } catch (error) {
             console.warn('Failed to reset to user location.', error);
-            expectAnimatedMoveRef.current = true;
-            setPointOfView(prev => ({ ...KANSAS_LOCATION, altitude: prev.altitude }));
-            activeInteractionGlobeRef.current = null;
+            goToPlaceRef.current({ lat: KANSAS_LOCATION.lat, lng: KANSAS_LOCATION.lng }, 'main');
         } finally { 
             setIsLoading(false); 
         }
@@ -471,7 +527,8 @@ const GlobeViewer: React.FC = () => {
 
     /**
      * Move to a searched place. In dual-point mode only the searched globe moves and the
-     * lock offset is recalculated, so search sets each point independently.
+     * lock offset is recalculated, so search sets each point independently. A place with its
+     * own altitude (a landmark) zooms both globes to it, keeping them at the same scale.
      */
     const goToPlace = (coords: LocationCoordinates, globeIdentifier: 'main' | 'secondary') => {
         if (!initialAnimationDone.current) return;
@@ -482,14 +539,14 @@ const GlobeViewer: React.FC = () => {
 
         // Drive the globes directly and hold off the POV sync effects and zoom handler until the animation ends
         programmaticMoveInProgressRef.current = true;
-        const target = { ...coords, altitude: latestPovs.current.primary.altitude };
+        const target = { ...coords, altitude: coords.altitude ?? latestPovs.current.primary.altitude };
 
         if (secondaryGlobeMode === 'dual-point') {
-            const primary = globeIdentifier === 'main' ? target : latestPovs.current.primary as LocationCoordinates;
-            const secondary = globeIdentifier === 'secondary' ? target : latestPovs.current.secondary as LocationCoordinates;
+            const primary = globeIdentifier === 'main' ? target : { ...latestPovs.current.primary as LocationCoordinates, altitude: target.altitude };
+            const secondary = globeIdentifier === 'secondary' ? target : { ...latestPovs.current.secondary as LocationCoordinates, altitude: target.altitude };
             povOffset.current = { lat: secondary.lat - primary.lat, lng: secondary.lng - primary.lng };
-            const globe = globeIdentifier === 'main' ? globeEl : secondaryGlobeEl;
-            globe.current?.pointOfView(target, PLACE_ANIMATION_MS);
+            globeEl.current?.pointOfView(primary, PLACE_ANIMATION_MS);
+            secondaryGlobeEl.current?.pointOfView(secondary, PLACE_ANIMATION_MS);
             setPointOfView(primary);
             setSecondaryPointOfView(secondary);
         } else {
@@ -504,6 +561,30 @@ const GlobeViewer: React.FC = () => {
             placeMoveTimer.current = null;
         }, PLACE_ANIMATION_MS + 100);
     };
+    goToPlaceRef.current = goToPlace;
+
+    /**
+     * Searched points are usually unrelated places to explore side by side (a house and a
+     * landmark), so unlock the globes for them unless the user has set the lock themselves.
+     */
+    const goToSearchedPlace = (coords: LocationCoordinates, globeIdentifier: 'main' | 'secondary') => {
+        if (secondaryGlobeMode === 'dual-point' && !lockChosenByUser.current) setIsDualModeLocked(false);
+        goToPlace(coords, globeIdentifier);
+    };
+
+    /**
+     * Switch to dual-point mode with the secondary search open on the landmark list. The
+     * secondary point starts at the primary one until a place is picked.
+     */
+    const startComparison = () => {
+        setSecondaryPointOfView({ ...latestPovs.current.primary });
+        setOpenSecondarySearch(true);
+        handleSecondaryGlobeOptionChange('dual-point');
+    };
+
+    useEffect(() => {
+        if (secondaryGlobeMode !== 'dual-point') setOpenSecondarySearch(false);
+    }, [secondaryGlobeMode]);
 
     const handleSecondaryGlobeOptionChange = (value: string) => {
         const slug = (value === 'antipodal' || value === 'dual-point') 
@@ -708,9 +789,12 @@ const GlobeViewer: React.FC = () => {
                                         {secondaryGlobeMode === 'dual-point' ? (
                                             <LocationSearch 
                                                 displayText={secondaryCoordsText} 
-                                                onSelect={(coords) => goToPlace(coords, 'secondary')} 
+                                                onSelect={(coords) => goToSearchedPlace(coords, 'secondary')} 
                                                 className={`${coordsBoxClassName} ${getSecondaryClassNames('hover')}`} 
                                                 ariaLabel="Secondary point" 
+                                                suggestions={landmarkSuggestions} 
+                                                startEditing={openSecondarySearch} 
+                                                biasPoint={secondaryPointOfView} 
                                             />
                                         ) : (
                                             <div className={`${coordsBoxClassName} ${getSecondaryClassNames('hover')}`}>
@@ -741,33 +825,46 @@ const GlobeViewer: React.FC = () => {
                                         </div>
                                         <LocationSearch 
                                             displayText={`${pointOfView.lat?.toFixed(3) ?? '---.-'}°, ${pointOfView.lng?.toFixed(3) ?? '---.-'}°`} 
-                                            onSelect={(coords) => goToPlace(coords, 'main')} 
+                                            onSelect={(coords) => goToSearchedPlace(coords, 'main')} 
+                                            biasPoint={pointOfView}
+                                            suggestions={landmarkSuggestions}
                                             className={`${coordsBoxClassName} group-hover:border-blue-500/70 group-hover:shadow-xl group-hover:shadow-blue-500/10`} 
                                             ariaLabel="Primary view" 
                                         />
                                     </div>
                                 </div>
-                                <div className="flex-1 w-full lg:flex-none flex flex-col justify-center space-y-2 lg:space-y-2.5 lg:justify-start">
-                                    {secondaryGlobeMode === 'dual-point' && (
+                                {/* Side by side, the top padding matches the label rows above the coordinate boxes,
+                                    so the buttons span from the top of the first box to the bottom of the last */}
+                                <div className="flex-1 w-full lg:flex-none flex flex-col gap-1.5 pt-5 sm:pt-6 lg:pt-0 lg:gap-2.5">
+                                    {secondaryGlobeMode === 'dual-point' ? (
                                         <button 
                                             onClick={() => handleDualModeLockToggle()} 
-                                            className="w-full flex items-center justify-center gap-1.5 sm:gap-2 px-3 py-2 sm:px-4 sm:py-2 bg-yellow-600/20 hover:bg-yellow-600/40 backdrop-blur-sm rounded-md sm:rounded-lg text-xs sm:text-sm font-medium text-yellow-200 hover:text-yellow-100 transition-all duration-300 border border-yellow-500/40 hover:border-yellow-500/60"
+                                            className="w-full flex-1 lg:flex-none flex items-center justify-center gap-1.5 sm:gap-2 px-3 py-1.5 sm:px-4 sm:py-2 bg-yellow-600/20 hover:bg-yellow-600/40 backdrop-blur-sm rounded-md sm:rounded-lg text-xs sm:text-sm font-medium text-yellow-200 hover:text-yellow-100 transition-all duration-300 border border-yellow-500/40 hover:border-yellow-500/60"
                                         >
                                             {isDualModeLocked ? <Lock size={13} /> : <Unlock size={13} />} 
                                             {isDualModeLocked ? 'Unlock Globes' : 'Lock Globes'}
+                                        </button>
+                                    ) : (
+                                        <button 
+                                            onClick={startComparison} 
+                                            title="Compare your location with a famous place at the same scale" 
+                                            className="w-full flex-1 lg:flex-none flex items-center justify-center gap-1.5 sm:gap-2 px-3 py-1.5 sm:px-4 sm:py-2 bg-yellow-600/20 hover:bg-yellow-600/40 backdrop-blur-sm rounded-md sm:rounded-lg text-xs sm:text-sm font-medium text-yellow-200 hover:text-yellow-100 transition-all duration-300 border border-yellow-500/40 hover:border-yellow-500/60"
+                                        >
+                                            <Landmark size={13} /> 
+                                            Compare Sizes
                                         </button>
                                     )}
                                     <button 
                                         onClick={resetToUserLocation} 
                                         disabled={isLoading} 
-                                        className="w-full flex items-center justify-center gap-1.5 sm:gap-2 px-3 py-2 sm:px-4 sm:py-2 bg-blue-600/80 hover:bg-blue-500/90 backdrop-blur-sm rounded-md sm:rounded-lg text-xs sm:text-sm font-medium text-blue-100 hover:text-white transition-all duration-300 border border-blue-500/50 hover:border-blue-400/70 disabled:opacity-60 disabled:cursor-not-allowed disabled:bg-blue-500/40"
+                                        className="w-full flex-1 lg:flex-none flex items-center justify-center gap-1.5 sm:gap-2 px-3 py-1.5 sm:px-4 sm:py-2 bg-blue-600/80 hover:bg-blue-500/90 backdrop-blur-sm rounded-md sm:rounded-lg text-xs sm:text-sm font-medium text-blue-100 hover:text-white transition-all duration-300 border border-blue-500/50 hover:border-blue-400/70 disabled:opacity-60 disabled:cursor-not-allowed disabled:bg-blue-500/40"
                                     >
                                         <Navigation size={13} className={isLoading ? 'animate-spin' : ''} /> 
                                         My Location
                                     </button>
                                     <button 
                                         onClick={() => setShowInfoModal(true)} 
-                                        className="w-full flex items-center justify-center gap-1.5 sm:gap-2 px-3 py-2 sm:px-4 sm:py-2 bg-neutral-700/40 hover:bg-neutral-700/60 backdrop-blur-sm rounded-md sm:rounded-lg text-xs sm:text-sm font-medium text-neutral-300 hover:text-neutral-100 transition-all duration-300 border border-neutral-600/70 hover:border-neutral-500/90"
+                                        className="w-full flex-1 lg:flex-none flex items-center justify-center gap-1.5 sm:gap-2 px-3 py-1.5 sm:px-4 sm:py-2 bg-neutral-700/40 hover:bg-neutral-700/60 backdrop-blur-sm rounded-md sm:rounded-lg text-xs sm:text-sm font-medium text-neutral-300 hover:text-neutral-100 transition-all duration-300 border border-neutral-600/70 hover:border-neutral-500/90"
                                     >
                                         <Settings size={13} /> 
                                         Display Options

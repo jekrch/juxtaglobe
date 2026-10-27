@@ -59,3 +59,54 @@ export const parseCoordinates = (input: string): LocationCoordinates | null => {
   if (Math.abs(lat) > 90 || Math.abs(lng) > 180) return null;
   return { lat, lng };
 };
+
+// A place's pin in a Google Maps link, e.g. ".../data=!3m1!4b1!4m6!3m5!8m2!3d40.7484!4d-73.9857"
+const LINK_PIN_PATTERN = /!3d(-?\d+(?:\.\d+)?)!4d(-?\d+(?:\.\d+)?)/;
+// The centre of the view a Google Maps link opens, e.g. ".../@40.7484,-73.9857,17z"
+const LINK_VIEW_PATTERN = /@(-?\d+(?:\.\d+)?),(-?\d+(?:\.\d+)?)/;
+// Query parameters Google and Apple Maps links carry "lat,lng" in, e.g. ?q=40.7484,-73.9857
+const LINK_COORDINATE_PARAMS = ['q', 'query', 'll', 'center', 'coordinate', 'destination', 'daddr'];
+const LINK_PAIR_PATTERN = /^\s*(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)\s*$/;
+
+const parseUrl = (input: string): URL | null => {
+  const trimmed = input.trim();
+  if (/\s/.test(trimmed)) return null;
+  try {
+    return new URL(/^https?:\/\//i.test(trimmed) ? trimmed : `https://${trimmed}`);
+  } catch {
+    return null;
+  }
+};
+
+const toCoordinates = (latText: string, lngText: string): LocationCoordinates | null => {
+  const lat = parseFloat(latText);
+  const lng = parseFloat(lngText);
+  return Math.abs(lat) <= 90 && Math.abs(lng) <= 180 ? { lat, lng } : null;
+};
+
+/**
+ * Read the location from a pasted Google Maps or Apple Maps link: a place's pin, coordinates in
+ * its query, or else the centre of the view it opens.
+ */
+export const parseMapLink = (input: string): LocationCoordinates | null => {
+  const url = parseUrl(input);
+  if (!url) return null;
+  const isGoogle = /(^|\.)google\.[a-z.]+$/.test(url.hostname)
+    && (url.hostname.startsWith('maps.') || url.pathname.startsWith('/maps'));
+  if (!isGoogle && url.hostname !== 'maps.apple.com') return null;
+
+  const pin = LINK_PIN_PATTERN.exec(url.pathname);
+  if (pin) return toCoordinates(pin[1], pin[2]);
+  for (const param of LINK_COORDINATE_PARAMS) {
+    const pair = LINK_PAIR_PATTERN.exec(url.searchParams.get(param) ?? '');
+    if (pair) return toCoordinates(pair[1], pair[2]);
+  }
+  const view = LINK_VIEW_PATTERN.exec(url.pathname);
+  return view ? toCoordinates(view[1], view[2]) : null;
+};
+
+/** Short share links (maps.app.goo.gl) only redirect server-side, so they can't be read here */
+export const isMapShortLink = (input: string): boolean => {
+  const url = parseUrl(input);
+  return !!url && (url.hostname === 'maps.app.goo.gl' || (url.hostname === 'goo.gl' && url.pathname.startsWith('/maps')));
+};

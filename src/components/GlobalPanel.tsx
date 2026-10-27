@@ -2,7 +2,7 @@ import React, { useEffect, useMemo, useRef, useState } from 'react';
 import Globe from 'react-globe.gl';
 import type { GlobeMethods } from 'react-globe.gl';
 import type { PointOfView } from '../types';
-import { Camera, MathUtils, Mesh, Object3D, OrthographicCamera, PerspectiveCamera, SphereGeometry, Texture, Vector3 } from 'three';
+import { Camera, ImageLoader, MathUtils, Mesh, Object3D, OrthographicCamera, PerspectiveCamera, SphereGeometry, Texture, TextureLoader, Vector3 } from 'three';
 import type { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
 
 // Sharpen textures viewed at oblique angles (globe edges). three.js clamps this
@@ -32,6 +32,11 @@ const GLOBE_GL_ROTATE_FACTOR = 0.3;
 const GLOBE_GL_CAMERA_NEAR = 0.05;
 // Closest zoom, in globe radii (~32 m above Earth)
 const MIN_ALTITUDE = 0.000005;
+// Most tile downloads running at once, across both globes. Few enough that a new level's tiles
+// start soon after a zoom, enough to keep the connection busy.
+const MAX_TILE_REQUESTS_IN_FLIGHT = 8;
+// How long the tile level has to hold still before a zoom counts as over
+const ZOOM_SETTLE_MS = 400;
 
 type TileUrlFn = (x: number, y: number, z: number) => string;
 
@@ -44,7 +49,13 @@ const findGlobeGroup = (globe: GlobeMethods) => {
   return globeGroup;
 };
 
-type TileEngine = Object3D & { level: number; maxLevel: number; clearTiles: () => void; updatePov: (camera: unknown) => void };
+type TileEngine = Object3D & {
+  level: number;
+  maxLevel: number;
+  tileUrl?: TileUrlFn;
+  clearTiles: () => void;
+  updatePov: (camera: unknown) => void;
+};
 
 const findTileEngine = (globe: GlobeMethods) =>
   findGlobeGroup(globe)?.children.find(c => 'clearTiles' in c) as TileEngine | undefined;
@@ -122,6 +133,175 @@ const recenterTilesOnAdd = (globe: GlobeMethods) => {
     return add.apply(this, objects);
   };
   tileEngine.userData.recentersTiles = true;
+};
+
+interface TileRequest {
+  engine: TileEngine;
+  level: number;
+  order: number;
+  start: () => HTMLImageElement;
+  // Hands the engine an empty result, so it clears its loading flag and refetches the tile if needed
+  drop: () => void;
+  image?: HTMLImageElement;
+}
+
+// Tile URLs the engines are about to load, with the engine and level each is for
+const pendingTileRequests = new Map<string, { engine: TileEngine; level: number }>();
+const queuedTileRequests: TileRequest[] = [];
+const inFlightTileRequests = new Set<TileRequest>();
+let tileRequestCount = 0;
+
+const cancelTileRequest = (request: TileRequest) => {
+  if (inFlightTileRequests.delete(request)) request.image!.src = ''; // aborts the download
+  else queuedTileRequests.splice(queuedTileRequests.indexOf(request), 1);
+  request.drop();
+};
+
+// Stops a running request and puts it back in the queue, to finish once more urgent ones have
+const pauseTileRequest = (request: TileRequest) => {
+  inFlightTileRequests.delete(request);
+  request.image!.src = '';
+  queuedTileRequests.push(request);
+};
+
+// Requests for an engine's current level go first, then the coarser levels beneath it, finest first.
+// While zooming, the level it's working through goes ahead of them all.
+const tileRequestDepth = (request: TileRequest) => {
+  const { engine } = request;
+  if (engine.userData.zooming && request.level === engine.userData.progressLevel) return -1;
+  return engine.level - request.level;
+};
+
+const startTileRequests = () => {
+  // Zooming out removes the finer levels' tiles, so their downloads are wasted
+  [...inFlightTileRequests, ...queuedTileRequests]
+    .filter(request => request.level > request.engine.level)
+    .forEach(cancelTileRequest);
+
+  // The current level changes faster than its tiles load during a long zoom, so always chasing it
+  // would leave every level half loaded. Finish one level instead, then jump to wherever the zoom
+  // has got to, so the view keeps sharpening a full level at a time.
+  const requests = [...inFlightTileRequests, ...queuedTileRequests];
+  new Set(requests.map(request => request.engine)).forEach(engine => {
+    const { userData } = engine;
+    if (!userData.zooming) userData.progressLevel = undefined;
+    else if (!requests.some(request => request.engine === engine && request.level === userData.progressLevel)) {
+      userData.progressLevel = engine.level;
+    }
+  });
+
+  while (inFlightTileRequests.size < MAX_TILE_REQUESTS_IN_FLIGHT) {
+    // Newest first within a level, as those cover where the camera is now. Hold off while tiles are off.
+    let next: TileRequest | undefined;
+    for (const request of queuedTileRequests) {
+      if (!request.engine.tileUrl) continue;
+      const depth = tileRequestDepth(request);
+      const nextDepth = next && tileRequestDepth(next);
+      if (!next || depth < nextDepth! || (depth === nextDepth && request.order > next.order)) next = request;
+    }
+    if (!next) break;
+    queuedTileRequests.splice(queuedTileRequests.indexOf(next), 1);
+    inFlightTileRequests.add(next);
+    next.image = next.start();
+  }
+};
+
+/**
+ * The tile engine starts loading every tile of each level it passes through as soon as it gets
+ * there, and never cancels any, so after a zoom the tiles for the level in view wait behind all
+ * the coarser ones on the way down. Queue its loads instead, a few at a time, starting with the
+ * current level, and cancel those for levels it has zoomed back out of.
+ */
+const loadTexture = TextureLoader.prototype.load;
+TextureLoader.prototype.load = function (url, onLoad, onProgress, onError) {
+  const pending = pendingTileRequests.get(url);
+  if (!pending) return loadTexture.call(this, url, onLoad, onProgress, onError);
+  pendingTileRequests.delete(url);
+
+  const texture = new Texture();
+  const request: TileRequest = {
+    ...pending,
+    order: tileRequestCount++,
+    // A paused request restarts with a new image, so ignore events from the one it abandoned
+    start: () => {
+      const image: HTMLImageElement = new ImageLoader(this.manager).setCrossOrigin(this.crossOrigin).setPath(this.path).load(
+        url,
+        () => {
+          if (request.image !== image || !inFlightTileRequests.delete(request)) return;
+          texture.image = image;
+          texture.needsUpdate = true;
+          onLoad?.(texture);
+          startTileRequests();
+        },
+        undefined,
+        error => {
+          if (request.image !== image || !inFlightTileRequests.delete(request)) return;
+          onError?.(error);
+          startTileRequests();
+        },
+      );
+      return image;
+    },
+    drop: () => onLoad?.(texture),
+  };
+  queuedTileRequests.push(request);
+  startTileRequests();
+  return texture;
+};
+
+const prioritizeTileRequests = (globe: GlobeMethods) => {
+  const tileEngine = findTileEngine(globe);
+  if (!tileEngine || tileEngine.userData.prioritizesTiles) return;
+
+  // Note which engine and level each tile URL is for, as the loader only gets the URL
+  const { get, set } = Object.getOwnPropertyDescriptor(Object.getPrototypeOf(tileEngine), 'tileUrl')!;
+  Object.defineProperty(tileEngine, 'tileUrl', {
+    get,
+    set(tileUrl?: TileUrlFn) {
+      set!.call(this, tileUrl && ((x: number, y: number, z: number) => {
+        const url = tileUrl(x, y, z);
+        pendingTileRequests.set(url, { engine: tileEngine, level: z });
+        return url;
+      }));
+    },
+  });
+  tileEngine.tileUrl = get!.call(tileEngine);
+
+  // Once the zoom lands, the level in view is all that matters, so pause the coarser levels still
+  // downloading if its tiles are waiting. They finish afterwards, as fallback beneath it.
+  const settleZoom = () => {
+    tileEngine.userData.zooming = false;
+    const landedLevelWaiting = queuedTileRequests.some(r => r.engine === tileEngine && r.level === tileEngine.level);
+    if (landedLevelWaiting) {
+      [...inFlightTileRequests]
+        .filter(request => request.engine === tileEngine && request.level < tileEngine.level)
+        .forEach(pauseTileRequest);
+    }
+    startTileRequests();
+  };
+
+  // Level changes happen here, which can make queued and running requests obsolete
+  const updatePov = tileEngine.updatePov;
+  tileEngine.updatePov = function (cam) {
+    const prevLevel = this.level;
+    updatePov.call(this, cam);
+    if (this.level !== prevLevel) {
+      this.userData.zooming = true;
+      clearTimeout(this.userData.settleTimer);
+      this.userData.settleTimer = setTimeout(settleZoom, ZOOM_SETTLE_MS);
+    }
+    startTileRequests();
+  };
+
+  // Cleared tiles are never shown, even if their requests finish
+  const clearTiles = tileEngine.clearTiles;
+  tileEngine.clearTiles = () => {
+    clearTiles();
+    [...inFlightTileRequests, ...queuedTileRequests]
+      .filter(request => request.engine === tileEngine)
+      .forEach(cancelTileRequest);
+  };
+  tileEngine.userData.prioritizesTiles = true;
 };
 
 /**
@@ -212,6 +392,7 @@ const GlobePanel: React.FC<GlobePanelProps> = ({
       addBaseImageUnderlay(globeRef.current);
       recenterTilesOnAdd(globeRef.current);
       fillSkippedTileLevels(globeRef.current);
+      prioritizeTileRequests(globeRef.current);
     }
     applyTileMaxLevel();
     onGlobeReady();

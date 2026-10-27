@@ -51,6 +51,7 @@ JuxtaGlobe supports several URL parameters for sharing and bookmarking views:
 
 - `lat`, `lng`, `alt` - Primary globe coordinates and altitude
 - `lat2`, `lng2`, `alt2` - Secondary globe coordinates (dual-point mode only)
+- `lock=f` - Unlock the globes so each moves independently (dual-point mode only; locked by default)
 - `map=t` - Show map tiles when set to 't'
 
 Example URLs:
